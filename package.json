@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "nodemon index.js",
-    "seed": "node database/seed.js"
+    "seed": "node database/seed.js",
+    "reset:recommendations": "node scripts/resetRecommendations.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cors": "^2.8.5",

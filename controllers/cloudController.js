@@ -1,5 +1,13 @@
 import jwt from 'jsonwebtoken';
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CloudModel } from '../models/cloudModel.js';
+import { createOptimizationEngine, mountReasoner } from '../optimization_engine/index.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const simulatorScript = path.resolve(__dirname, '../simulator/simulator.py');
 
 const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
 
@@ -187,8 +195,30 @@ export const getResourceById = async (req, res) => {
 
 export const getResourceMetrics = async (req, res) => {
   try {
-    const metrics = await CloudModel.getMetricsForResource(req.params.id);
+    const requestedDays = Number(req.query.days ?? 30);
+    if (![7, 14, 30, 90].includes(requestedDays)) {
+      return res.status(400).json({ error: "Days must be one of 7, 14, 30, or 90." });
+    }
+    const metrics = await CloudModel.getMetricsForResource(req.params.id, requestedDays);
     res.json(metrics);
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const getFleetUtilization = async (req, res) => {
+  try {
+    const days = Number(req.query.days ?? 30);
+    if (![7, 14, 30, 90].includes(days)) {
+      return res.status(400).json({ error: "Days must be one of 7, 14, 30, or 90." });
+    }
+    const filters = {
+      region: typeof req.query.region === 'string' ? req.query.region : '',
+      environment: typeof req.query.environment === 'string' ? req.query.environment : '',
+      team: typeof req.query.team === 'string' ? req.query.team : '',
+    };
+    const utilization = await CloudModel.getFleetUtilization(days, filters);
+    res.json(utilization);
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -221,11 +251,65 @@ export const getRecommendations = async (req, res) => {
   }
 };
 
+export const refreshRecommendationsData = async (_req, res) => {
+  try {
+    const { refreshRecommendations } = await import('../database/connection.js');
+    await refreshRecommendations();
+    const recs = await CloudModel.getAllRecommendations();
+    res.json({ success: true, refreshed: true, recommendations: recs });
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const regenerateMetricsAndRecommendations = async (req, res) => {
+  try {
+    const { seed = Date.now() } = req.body ?? {};
+
+    await new Promise((resolve, reject) => {
+      execFile('python3', [simulatorScript, '--seed', String(seed)], {
+        cwd: path.dirname(simulatorScript),
+        timeout: 120000,
+      }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(stderr?.trim() || stdout?.trim() || error.message));
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
+
+    const { importGeneratedData, refreshRecommendations } = await import('../database/connection.js');
+    const importResult = await importGeneratedData({ force: true });
+    await refreshRecommendations();
+    const recs = await CloudModel.getAllRecommendations();
+
+    res.json({
+      success: true,
+      regenerated: true,
+      import: importResult,
+      recommendations: recs,
+    });
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
 export const updateRecommendationAction = async (req, res) => {
   try {
-    const { status } = req.body;
-    const result = await CloudModel.updateRecommendationStatus(req.params.id, status || 'Applied');
-    res.json({ success: true, ...result });
+    const { status } = req.body ?? {};
+    const statusMap = {
+      Accepted: 'Accepted',
+      Applied: 'Accepted',
+      Dismissed: 'Dismissed',
+      Implemented: 'Implemented',
+    };
+    if (!statusMap[status]) {
+      return res.status(400).json({ error: "Status must be Accepted, Dismissed, or Implemented." });
+    }
+    const result = await CloudModel.updateRecommendationStatus(req.params.id, statusMap[status]);
+    if (!result.updated) return res.status(404).json({ error: "Recommendation not found." });
+    res.json({ success: true, ...result, status: statusMap[status] });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -233,8 +317,9 @@ export const updateRecommendationAction = async (req, res) => {
 
 export const applyRecommendation = async (req, res) => {
   try {
-    const result = await CloudModel.updateRecommendationStatus(req.params.id, 'Applied');
-    res.json({ success: true, ...result });
+    const result = await CloudModel.updateRecommendationStatus(req.params.id, 'Accepted');
+    if (!result.updated) return res.status(404).json({ error: "Recommendation not found." });
+    res.json({ success: true, ...result, status: 'Accepted' });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -243,7 +328,8 @@ export const applyRecommendation = async (req, res) => {
 export const dismissRecommendation = async (req, res) => {
   try {
     const result = await CloudModel.updateRecommendationStatus(req.params.id, 'Dismissed');
-    res.json({ success: true, ...result });
+    if (!result.updated) return res.status(404).json({ error: "Recommendation not found." });
+    res.json({ success: true, ...result, status: 'Dismissed' });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -253,7 +339,7 @@ export const batchApplyRecommendations = async (req, res) => {
   try {
     const { rec_ids } = req.body;
     const savings = await CloudModel.getRecommendationSavings(rec_ids);
-    const result = await CloudModel.batchUpdateRecommendations(rec_ids, 'Applied');
+    const result = await CloudModel.batchUpdateRecommendations(rec_ids, 'Accepted');
     res.json({ success: true, applied_count: result.updated, total_estimated_savings: savings });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -281,7 +367,7 @@ export const getCostBreakdown = async (req, res) => {
 export const getCostForecast = async (req, res) => {
   try {
     const summary = await CloudModel.getCostSummary();
-    const current = summary ? summary.total_current_spend || 245000 : 245000;
+    const current = Number(summary?.total_current_spend ?? 0);
     res.json({
       current_monthly_spend: current,
       forecast_30_days: Math.round(current * 1.03),
@@ -296,12 +382,14 @@ export const getCostForecast = async (req, res) => {
 export const getCostBeforeVsAfter = async (req, res) => {
   try {
     const summary = await CloudModel.getCostSummary();
-    const current = summary ? summary.total_current_spend || 245000 : 245000;
+    const current = Number(summary?.total_current_spend ?? 0);
     const savings = await CloudModel.getPotentialSavings();
     res.json({
       current_monthly_spend: current,
       optimized_monthly_spend: Math.max(0, current - savings),
-      projected_monthly_savings: savings
+      projected_monthly_savings: savings,
+      included_statuses: ['Pending', 'Accepted', 'Implemented'],
+      note: 'Current spend remains based on inventory pricing. Projected savings include all non-dismissed recommendations and do not represent realized bill reductions.',
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -330,6 +418,77 @@ export const getForecast = async (req, res) => {
       projected_growth_rate_pct: 3.5,
       recommendation: "Review auto-scaling policies for dev clusters and terminate orphaned storage volumes."
     });
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const runOptimizationEngine = async (req, res) => {
+  try {
+    const { maxBudget = 250000, provider = 'local', aiReasoning = false } = req.body ?? {};
+    const budget = Number(maxBudget);
+    if (!Number.isFinite(budget) || budget < 0) {
+      return res.status(400).json({ error: "maxBudget must be a non-negative number." });
+    }
+
+    const candidates = (await CloudModel.getAllRecommendations())
+      .filter((item) => item.status !== 'Dismissed')
+      .sort((left, right) => right.estimated_monthly_saving - left.estimated_monthly_saving);
+    let budgetUsed = 0;
+    const selected = [];
+    const deferred = [];
+    for (const candidate of candidates) {
+      if (budgetUsed + candidate.estimated_monthly_saving <= budget) {
+        selected.push(candidate);
+        budgetUsed += candidate.estimated_monthly_saving;
+      } else {
+        deferred.push(candidate);
+      }
+    }
+    const recommendations = selected.map((item) => ({
+      ...item,
+      estimated_savings: item.estimated_monthly_saving,
+      utilization: {
+        p95Cpu: item.p95_cpu,
+        p99Cpu: item.p99_cpu,
+        p95Memory: item.p95_memory,
+        p99Memory: item.p99_memory,
+      },
+    }));
+    const result = {
+      engine: 'peak-aware-target-recommendation-engine',
+      summary: {
+        objective: 'select the highest monthly savings that fit the requested savings budget',
+        candidate_count: candidates.length,
+        selected_count: recommendations.length,
+        total_savings: Number(budgetUsed.toFixed(2)),
+        budget_used: Number(budgetUsed.toFixed(2)),
+        max_budget: budget,
+      },
+      recommendations,
+      deferred_recommendations: deferred,
+    };
+
+    if (aiReasoning && provider !== 'local') {
+      try {
+        const reasoner = mountReasoner(createOptimizationEngine({ provider }), provider, {
+          apiKey: provider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.OPENAI_API_KEY,
+        });
+        result.ai = await reasoner.ai.reason({
+          recommendations: result.recommendations,
+          summary: { totalSavings: result.summary.total_savings },
+        });
+      } catch (reasoningError) {
+        result.ai = {
+          provider,
+          status: 'fallback',
+          message: 'AI reasoner could not be mounted; local optimization explanation was used instead.',
+          error: getErrorMessage(reasoningError),
+        };
+      }
+    }
+
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }

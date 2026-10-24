@@ -17,6 +17,7 @@ router.get("/inventory", authenticateToken, controller.getInventory)
 router.get("/inventory/stats", authenticateToken, controller.getInventoryStats)
 router.get("/resources/:id", authenticateToken, controller.getResourceById)
 router.get("/metrics/anomalies", authenticateToken, controller.getAnomalies)
+router.get("/metrics/fleet", authenticateToken, controller.getFleetUtilization)
 router.get("/metrics/:id", authenticateToken, controller.getResourceMetrics)
 router.get("/metrics/:id/percentiles", authenticateToken, controller.getResourcePercentiles)
 

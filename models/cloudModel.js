@@ -11,6 +11,13 @@ const queryOne = (sql, params = []) => new Promise((resolve, reject) => {
   });
 });
 
+const queryAll = (sql, params = []) => new Promise((resolve, reject) => {
+  db.all(sql, ...params, (err, rows) => {
+    if (err) reject(err);
+    else resolve(rows.map(normalizeRow));
+  });
+});
+
 export const CloudModel = {
   getUserByEmail: (email) => queryOne(`SELECT * FROM users WHERE email = ?`, [email]),
   getUserById: (userId) => queryOne(`SELECT * FROM users WHERE user_id = ?`, [userId]),
@@ -80,13 +87,75 @@ export const CloudModel = {
     FROM inventory
   `),
 
-  getMetricsForResource: (id) => {
-    return new Promise((resolve, reject) => {
-      db.all(`SELECT * FROM metrics WHERE resource_id = ? ORDER BY timestamp DESC LIMIT 50`, id, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
+  getMetricsForResource: (id, days = 30) => {
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    return queryAll(
+      `SELECT * FROM metrics WHERE resource_id = ? AND CAST(timestamp AS TIMESTAMP) >= CAST(? AS TIMESTAMP) ORDER BY timestamp`,
+      [id, cutoff],
+    );
+  },
+
+  getFleetUtilization: async (days, filters = {}) => {
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const conditions = [`CAST(metrics.timestamp AS TIMESTAMP) >= CAST(? AS TIMESTAMP)`];
+    const params = [cutoff];
+    for (const [field, value] of [
+      ['region', filters.region],
+      ['environment', filters.environment],
+      ['owner', filters.team],
+    ]) {
+      if (value) {
+        conditions.push(`inventory.${field} = ?`);
+        params.push(value);
+      }
+    }
+    const where = conditions.join(' AND ');
+    const [summary, history] = await Promise.all([
+      queryOne(`SELECT
+          COUNT(*) AS sample_count,
+          COUNT(DISTINCT metrics.resource_id) AS resource_count,
+          MIN(CAST(metrics.timestamp AS TIMESTAMP)) AS history_start,
+          MAX(CAST(metrics.timestamp AS TIMESTAMP)) AS history_end,
+          AVG(metrics.cpu_pct) AS avg_cpu,
+          quantile_cont(metrics.cpu_pct, 0.95) AS p95_cpu,
+          AVG(metrics.memory_pct) AS avg_memory,
+          quantile_cont(metrics.memory_pct, 0.95) AS p95_memory,
+          AVG(metrics.disk_pct) AS avg_disk,
+          quantile_cont(metrics.disk_pct, 0.95) AS p95_disk,
+          AVG(metrics.iops) AS avg_iops,
+          AVG(metrics.network_in_mb) AS avg_network_in_mb,
+          AVG(metrics.network_out_mb) AS avg_network_out_mb
+        FROM metrics
+        JOIN inventory USING (resource_id)
+        WHERE ${where}`, params),
+      queryAll(`SELECT
+          time_bucket(INTERVAL '1 hour', CAST(metrics.timestamp AS TIMESTAMP)) AS timestamp,
+          AVG(metrics.cpu_pct) AS cpu_pct,
+          MAX(metrics.cpu_pct) AS peak_cpu_pct,
+          AVG(metrics.memory_pct) AS memory_pct,
+          MAX(metrics.memory_pct) AS peak_memory_pct,
+          AVG(metrics.disk_pct) AS disk_pct,
+          MAX(metrics.disk_pct) AS peak_disk_pct,
+          AVG(metrics.iops) AS iops,
+          AVG(metrics.network_in_mb) AS network_in_mb,
+          AVG(metrics.network_out_mb) AS network_out_mb,
+          COUNT(*) AS sample_count
+        FROM metrics
+        JOIN inventory USING (resource_id)
+        WHERE ${where}
+        GROUP BY 1
+        ORDER BY 1`, params),
+    ]);
+    return {
+      days,
+      filters: {
+        region: filters.region || null,
+        environment: filters.environment || null,
+        team: filters.team || null,
+      },
+      summary,
+      history,
+    };
   },
 
   getResourcePercentiles: (id) => queryOne(`
@@ -114,9 +183,13 @@ export const CloudModel = {
 
   getAllRecommendations: () => {
     return new Promise((resolve, reject) => {
-      db.all(`SELECT * FROM recommendations ORDER BY estimated_monthly_saving DESC`, (err, rows) => {
+      db.all(`SELECT recommendations.*, inventory.name, inventory.type, inventory.region,
+          inventory.environment, inventory.owner, inventory.disk_size_gb
+        FROM recommendations
+        JOIN inventory USING (resource_id)
+        ORDER BY estimated_monthly_saving DESC`, (err, rows) => {
         if (err) reject(err);
-        else resolve(rows);
+        else resolve(rows.map(normalizeRow));
       });
     });
   },
@@ -127,7 +200,7 @@ export const CloudModel = {
     return queryOne(
       `SELECT COALESCE(SUM(estimated_monthly_saving), 0) as total_savings
        FROM recommendations
-       WHERE status = 'Pending' AND rec_id IN (${placeholders})`,
+       WHERE status IN ('Pending', 'Accepted', 'Applied', 'Implemented') AND rec_id IN (${placeholders})`,
       recIds,
     ).then((row) => row.total_savings);
   },
@@ -156,27 +229,43 @@ export const CloudModel = {
 
   getCostSummary: () => queryOne(`SELECT SUM(monthly_cost) as total_current_spend FROM inventory`),
 
-  getCostBreakdown: () => {
-    return new Promise((resolve, reject) => {
-      db.all(`SELECT environment, SUM(monthly_cost) as cost FROM inventory GROUP BY environment`, (err, envRows) => {
-        if (err) return reject(err);
-        db.all(`SELECT owner, SUM(monthly_cost) as cost FROM inventory GROUP BY owner`, (err2, teamRows) => {
-          if (err2) return reject(err2);
-          
-          const by_environment = {};
-          envRows.forEach(r => by_environment[r.environment] = r.cost);
-
-          const by_department = {};
-          teamRows.forEach(r => by_department[r.owner] = r.cost);
-
-          resolve({ by_environment, by_department });
-        });
-      });
-    });
+  getCostBreakdown: async () => {
+    const [envRows, teamRows, savingRows] = await Promise.all([
+      queryAll(`SELECT environment, SUM(monthly_cost) AS cost FROM inventory GROUP BY environment`),
+      queryAll(`SELECT owner, SUM(monthly_cost) AS cost FROM inventory GROUP BY owner`),
+      queryAll(`SELECT inventory.environment, inventory.owner,
+          SUM(recommendations.estimated_monthly_saving) AS savings
+        FROM recommendations
+        JOIN inventory USING (resource_id)
+        WHERE recommendations.status IN ('Pending', 'Accepted', 'Applied', 'Implemented')
+        GROUP BY inventory.environment, inventory.owner`),
+    ]);
+    const by_environment = Object.fromEntries(envRows.map((row) => [row.environment, row.cost]));
+    const by_department = Object.fromEntries(teamRows.map((row) => [row.owner, row.cost]));
+    const savings_by_environment = {};
+    const savings_by_department = {};
+    for (const row of savingRows) {
+      savings_by_environment[row.environment] = (savings_by_environment[row.environment] ?? 0) + row.savings;
+      savings_by_department[row.owner] = (savings_by_department[row.owner] ?? 0) + row.savings;
+    }
+    return {
+      by_environment,
+      by_department,
+      savings_by_environment,
+      savings_by_department,
+      projected_by_environment: Object.fromEntries(Object.entries(by_environment).map(
+        ([environment, cost]) => [environment, Math.max(0, cost - (savings_by_environment[environment] ?? 0))],
+      )),
+      projected_by_department: Object.fromEntries(Object.entries(by_department).map(
+        ([owner, cost]) => [owner, Math.max(0, cost - (savings_by_department[owner] ?? 0))],
+      )),
+    };
   },
 
   getPotentialSavings: async () => {
-    const row = await queryOne(`SELECT SUM(estimated_monthly_saving) as total_savings FROM recommendations WHERE status = 'Pending'`);
+    const row = await queryOne(`SELECT SUM(estimated_monthly_saving) as total_savings
+      FROM recommendations
+      WHERE status IN ('Pending', 'Accepted', 'Applied', 'Implemented')`);
     return row ? row.total_savings || 0 : 0;
   }
 };
