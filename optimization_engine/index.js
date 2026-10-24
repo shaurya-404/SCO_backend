@@ -25,6 +25,8 @@ export const createOptimizationEngine = (config = {}) => {
         monthly_cost: item.monthly_cost,
         estimated_savings: item.estimatedSavings,
         confidence: Number((item.efficiency * 100).toFixed(1)),
+        risk_level: item.riskLevel,
+        target_configuration: item.targetConfiguration,
         reason: item.reason,
       }));
 

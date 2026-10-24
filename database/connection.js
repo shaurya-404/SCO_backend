@@ -52,7 +52,17 @@ export async function refreshRecommendations(withinTransaction = false) {
                 MAX(disk_pct) AS max_disk,
                 MAX(iops) AS max_iops,
                 MAX(network_in_mb) AS max_network_in,
-                MAX(network_out_mb) AS max_network_out
+                MAX(network_out_mb) AS max_network_out,
+                quantile_cont(cpu_pct, 0.95) FILTER (
+                    WHERE EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) >= 20
+                       OR EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) < 8
+                       OR EXTRACT(isodow FROM CAST(timestamp AS TIMESTAMP)) >= 6
+                ) AS off_hours_p95_cpu,
+                quantile_cont(memory_pct, 0.95) FILTER (
+                    WHERE EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) >= 20
+                       OR EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) < 8
+                       OR EXTRACT(isodow FROM CAST(timestamp AS TIMESTAMP)) >= 6
+                ) AS off_hours_p95_memory
             FROM metrics
             GROUP BY resource_id
         ),
@@ -67,7 +77,9 @@ export async function refreshRecommendations(withinTransaction = false) {
                 'No attachment and zero disk, I/O, and network activity across at least 14 days of recorded metrics.'
                     AS reason,
                 ROUND(inventory.monthly_cost, 2) AS estimated_monthly_saving,
-                'Safe' AS risk_level
+                'Safe' AS risk_level,
+                NULL::VARCHAR AS target_configuration,
+                95.0 AS confidence
             FROM inventory
             JOIN metric_summary USING (resource_id)
             WHERE inventory.type IN ('block-volume', 'public-ip')
@@ -84,7 +96,11 @@ export async function refreshRecommendations(withinTransaction = false) {
             SELECT
                 'rightsize-' || inventory.resource_id AS rec_id,
                 inventory.resource_id,
-                'Review VM for right-sizing' AS action,
+                'Right-size VM to '
+                    || CAST(GREATEST(1, CAST(inventory.vcpu / 2 AS INTEGER)) AS VARCHAR)
+                    || ' vCPU / '
+                    || CAST(GREATEST(1, CAST(inventory.ram_gb / 2 AS INTEGER)) AS VARCHAR)
+                    || ' GB RAM' AS action,
                 'Utilization across '
                     || CAST(metric_summary.sample_count AS VARCHAR)
                     || ' recorded samples is consistently low (p95 CPU '
@@ -95,10 +111,27 @@ export async function refreshRecommendations(withinTransaction = false) {
                     || CAST(ROUND(metric_summary.p95_memory, 1) AS VARCHAR)
                     || '%, p99 memory '
                     || CAST(ROUND(metric_summary.p99_memory, 1) AS VARCHAR)
-                    || '%). Savings estimate is 25% of current monthly cost; validate target capacity and pricing.'
+                    || '%). Proposed target halves the current vCPU and memory; verify workload and provider pricing before rollout.'
                     AS reason,
-                ROUND(inventory.monthly_cost * 0.25, 2) AS estimated_monthly_saving,
-                'Low' AS risk_level
+                ROUND(GREATEST(0,
+                    inventory.monthly_cost - (
+                        GREATEST(1, CAST(inventory.vcpu / 2 AS INTEGER)) * 600
+                        + GREATEST(1, CAST(inventory.ram_gb / 2 AS INTEGER)) * 150
+                        + inventory.disk_size_gb * 4
+                    )
+                ), 2) AS estimated_monthly_saving,
+                CASE
+                    WHEN metric_summary.p99_cpu <= 15 AND metric_summary.p99_memory <= 40 THEN 'Low'
+                    ELSE 'Medium'
+                END AS risk_level,
+                CAST(GREATEST(1, CAST(inventory.vcpu / 2 AS INTEGER)) AS VARCHAR)
+                    || ' vCPU / '
+                    || CAST(GREATEST(1, CAST(inventory.ram_gb / 2 AS INTEGER)) AS VARCHAR)
+                    || ' GB RAM' AS target_configuration,
+                CASE
+                    WHEN metric_summary.p99_cpu <= 15 AND metric_summary.p99_memory <= 40 THEN 90.0
+                    ELSE 75.0
+                END AS confidence
             FROM inventory
             JOIN metric_summary USING (resource_id)
             WHERE inventory.type = 'VM'
@@ -109,6 +142,31 @@ export async function refreshRecommendations(withinTransaction = false) {
                 AND metric_summary.p99_memory <= 60
                 AND metric_summary.max_cpu <= 90
                 AND metric_summary.max_memory <= 90
+                AND inventory.vcpu >= 4
+
+            UNION ALL
+
+            SELECT
+                'schedule-' || inventory.resource_id AS rec_id,
+                inventory.resource_id,
+                'Schedule off-hours shutdown (8 PM–8 AM)' AS action,
+                'Recorded off-hours and weekend p95 utilization is low (CPU '
+                    || CAST(ROUND(metric_summary.off_hours_p95_cpu, 1) AS VARCHAR)
+                    || '%, memory '
+                    || CAST(ROUND(metric_summary.off_hours_p95_memory, 1) AS VARCHAR)
+                    || '%). Schedule only after confirming no overnight jobs or availability requirements.'
+                    AS reason,
+                ROUND(inventory.monthly_cost * 0.5, 2) AS estimated_monthly_saving,
+                'Medium' AS risk_level,
+                'Weekdays 8 PM–8 AM; weekends: stopped' AS target_configuration,
+                70.0 AS confidence
+            FROM inventory
+            JOIN metric_summary USING (resource_id)
+            WHERE inventory.type = 'VM'
+                AND inventory.environment IN ('dev', 'staging')
+                AND metric_summary.sample_count >= 1344
+                AND metric_summary.off_hours_p95_cpu <= 10
+                AND metric_summary.off_hours_p95_memory <= 30
             )
             SELECT
                 candidates.rec_id,
@@ -117,15 +175,19 @@ export async function refreshRecommendations(withinTransaction = false) {
                 candidates.reason,
                 candidates.estimated_monthly_saving,
                 candidates.risk_level,
+                candidates.target_configuration,
+                candidates.confidence,
                 COALESCE(recommendations.status, 'Pending') AS status
             FROM candidates
             LEFT JOIN recommendations USING (rec_id)`);
 
         await run(`DELETE FROM recommendations`);
         await run(`INSERT INTO recommendations (
-            rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level, status
+            rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level,
+            target_configuration, confidence, status
         )
-        SELECT rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level, status
+        SELECT rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level,
+            target_configuration, confidence, status
         FROM generated_recommendations`);
         await run(`DROP TABLE generated_recommendations`);
         if (!withinTransaction) {
@@ -177,8 +239,17 @@ async function ensureGeneratedDataTables() {
         reason VARCHAR,
         estimated_monthly_saving DOUBLE,
         risk_level VARCHAR,
+        target_configuration VARCHAR,
+        confidence DOUBLE,
         status VARCHAR
     )`);
+    const recommendationColumns = await all(`PRAGMA table_info('recommendations')`);
+    if (!recommendationColumns.some((column) => column.name === 'target_configuration')) {
+        await run(`ALTER TABLE recommendations ADD COLUMN target_configuration VARCHAR`);
+    }
+    if (!recommendationColumns.some((column) => column.name === 'confidence')) {
+        await run(`ALTER TABLE recommendations ADD COLUMN confidence DOUBLE`);
+    }
 
     const inventoryColumns = await all(`PRAGMA table_info('inventory')`);
     if (!inventoryColumns.some((column) => column.name === 'attached_to')) {
@@ -295,21 +366,19 @@ export async function initializeDatabase() {
         website VARCHAR NOT NULL,
         industry VARCHAR NOT NULL,
         contact_email VARCHAR NOT NULL,
-        address VARCHAR NOT NULL
+        address VARCHAR NOT NULL,
+        monthly_budget DOUBLE DEFAULT 1000000
     )`);
-
-    await run(`CREATE TABLE IF NOT EXISTS company_settings (
-        company_id VARCHAR PRIMARY KEY,
-        name VARCHAR NOT NULL,
-        website VARCHAR NOT NULL,
-        industry VARCHAR NOT NULL,
-        contact_email VARCHAR NOT NULL,
-        address VARCHAR NOT NULL
-    )`);
+    const companyColumns = await all(`PRAGMA table_info('company_settings')`);
+    if (!companyColumns.some((column) => column.name === 'monthly_budget')) {
+        await run(`ALTER TABLE company_settings ADD COLUMN monthly_budget DOUBLE DEFAULT 1000000`);
+    }
 
     const company = await all(`SELECT company_id FROM company_settings WHERE company_id = 'default'`);
     if (company.length === 0) {
-        await run(`INSERT INTO company_settings VALUES ('default', 'Your Company', '', '', '', '')`);
+        await run(`INSERT INTO company_settings (
+            company_id, name, website, industry, contact_email, address, monthly_budget
+        ) VALUES ('default', 'Your Company', '', '', '', '', 1000000)`);
     }
 
     const tables = await all(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'users'`);

@@ -1,0 +1,50 @@
+{
+  "dataset": "SmartCloud Optimizer simulated local demo data",
+  "currency": "INR",
+  "resource_count": 100,
+  "resource_mix": {
+    "VM": 80,
+    "block-volume": 12,
+    "public-ip": 8
+  },
+  "metric_history_days": 30,
+  "metric_interval_minutes": 15,
+  "pricing_assumptions": {
+    "VM": "INR 600 per vCPU-month + INR 150 per GB RAM-month + INR 4 per disk GB-month",
+    "block-volume": "INR 5 per GB-month",
+    "public-ip": "INR 300 per month",
+    "note": "Illustrative flat rates, not a quote from a cloud provider."
+  },
+  "recommendation_assumptions": {
+    "minimum_metric_history_days": 14,
+    "rightsize_limits": {
+      "p95_cpu_max_pct": 20,
+      "p99_cpu_max_pct": 30,
+      "p95_memory_max_pct": 50,
+      "p99_memory_max_pct": 60,
+      "absolute_cpu_and_memory_max_pct": 90
+    },
+    "rightsize_target": "Half the current vCPU and RAM when current vCPU is at least 4; retain disk capacity.",
+    "schedule_target": "Weekdays 8 PM to 8 AM and weekends, only when off-hours p95 CPU is at most 10% and memory at most 30%.",
+    "schedule_savings": "50% of listed monthly compute-resource cost, capped with other suggestions at resource cost.",
+    "confidence_and_risk": "Rule-based estimates; validate provider SKU availability, workload peaks, SLAs, and change windows."
+  },
+  "forecast_assumptions": {
+    "method": "Compare the last 7 days of price-weighted utilization with the previous 7 days; linearly extrapolate and cap the change at 20% per 30 days.",
+    "limitation": "A utilization-derived spend-pressure proxy, not historical billing or a provider forecast."
+  },
+  "sustainability_assumptions": {
+    "kwh_per_inr_saved": 0.02,
+    "kg_co2e_per_kwh": 0.7,
+    "kg_co2e_per_tree_year": 22,
+    "limitation": "Illustrative factors applied to pending estimated savings, not measured energy use or carbon accounting."
+  },
+  "patterns": [
+    "Steady low-usage VMs",
+    "Bursty daily workloads",
+    "Nightly batch jobs",
+    "Development and staging VMs idle from 8 PM to 8 AM and on weekends",
+    "Orphaned volumes and public IPs with zero observed activity",
+    "One flagged production utilization spike"
+  ]
+}
