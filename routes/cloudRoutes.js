@@ -22,6 +22,8 @@ router.get("/metrics/:id/percentiles", authenticateToken, controller.getResource
 
 // Recommendations Routes
 router.get("/recommendations", authenticateToken, controller.getRecommendations)
+router.post("/recommendations/refresh", authenticateToken, controller.refreshRecommendationsData)
+router.post("/recommendations/regenerate", authenticateToken, controller.regenerateMetricsAndRecommendations)
 router.post("/recommendations/:id/action", authenticateToken, controller.updateRecommendationAction)
 router.post("/recommendations/:id/apply", authenticateToken, controller.applyRecommendation)
 router.post("/recommendations/:id/dismiss", authenticateToken, controller.dismissRecommendation)
@@ -36,6 +38,7 @@ router.get("/costs/before-vs-after", authenticateToken, controller.getCostBefore
 // Alerts & Bonus Features Routes
 router.get("/alerts", authenticateToken, controller.getAlerts)
 router.get("/forecast", authenticateToken, controller.getForecast)
+router.post("/optimization/run", authenticateToken, controller.runOptimizationEngine)
 router.post("/simulator/what-if", authenticateToken, controller.runSimulatorWhatIf)
 router.post("/ai/explain", authenticateToken, controller.explainAI)
 router.get("/export/:format", authenticateToken, controller.exportData)

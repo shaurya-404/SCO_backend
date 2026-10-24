@@ -1,5 +1,14 @@
 import jwt from 'jsonwebtoken';
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import db from '../database/connection.js';
 import { CloudModel } from '../models/cloudModel.js';
+import { createOptimizationEngine, mountReasoner } from '../optimization_engine/index.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const simulatorScript = path.resolve(__dirname, '../simulator/simulator.py');
 
 const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
 
@@ -221,6 +230,50 @@ export const getRecommendations = async (req, res) => {
   }
 };
 
+export const refreshRecommendationsData = async (_req, res) => {
+  try {
+    const { refreshRecommendations } = await import('../database/connection.js');
+    await refreshRecommendations();
+    const recs = await CloudModel.getAllRecommendations();
+    res.json({ success: true, refreshed: true, recommendations: recs });
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const regenerateMetricsAndRecommendations = async (req, res) => {
+  try {
+    const { seed = Date.now() } = req.body ?? {};
+
+    await new Promise((resolve, reject) => {
+      execFile('python3', [simulatorScript, '--seed', String(seed)], {
+        cwd: path.dirname(simulatorScript),
+        timeout: 120000,
+      }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(stderr?.trim() || stdout?.trim() || error.message));
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
+
+    const { importGeneratedData, refreshRecommendations } = await import('../database/connection.js');
+    const importResult = await importGeneratedData({ force: true });
+    await refreshRecommendations();
+    const recs = await CloudModel.getAllRecommendations();
+
+    res.json({
+      success: true,
+      regenerated: true,
+      import: importResult,
+      recommendations: recs,
+    });
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
 export const updateRecommendationAction = async (req, res) => {
   try {
     const { status } = req.body;
@@ -330,6 +383,60 @@ export const getForecast = async (req, res) => {
       projected_growth_rate_pct: 3.5,
       recommendation: "Review auto-scaling policies for dev clusters and terminate orphaned storage volumes."
     });
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const runOptimizationEngine = async (req, res) => {
+  try {
+    const { maxBudget, provider = 'local', aiReasoning = false } = req.body ?? {};
+
+    const [resources, metricRows] = await Promise.all([
+      CloudModel.getAllInventory(),
+      new Promise((resolve, reject) => {
+        db.all(`SELECT * FROM metrics ORDER BY resource_id, timestamp`, (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows || []);
+        });
+      }),
+    ]);
+
+    const metricsByResource = {};
+    for (const row of metricRows) {
+      if (!metricsByResource[row.resource_id]) {
+        metricsByResource[row.resource_id] = [];
+      }
+      metricsByResource[row.resource_id].push(row);
+    }
+
+    const engine = createOptimizationEngine({
+      maxBudget: Number(maxBudget) || 250000,
+      provider,
+    });
+
+    const result = engine.run({ resources, metricsByResource });
+
+    if (aiReasoning && provider !== 'local') {
+      try {
+        const attachedEngine = mountReasoner(engine, provider, {
+          apiKey: provider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.OPENAI_API_KEY,
+        });
+        result.ai = await attachedEngine.ai.reason({
+          recommendations: result.recommendations,
+          summary: result.summary,
+        });
+      } catch (reasoningError) {
+        result.ai = {
+          provider,
+          status: 'fallback',
+          message: 'AI reasoner could not be mounted; local optimization explanation was used instead.',
+          error: getErrorMessage(reasoningError),
+        };
+      }
+    }
+
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }

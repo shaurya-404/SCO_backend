@@ -33,7 +33,7 @@ const run = (sql, ...params) => new Promise((resolve, reject) => {
 const generatedDataDir = path.join(__dirname, '../simulator/generated');
 const sqlString = (value) => `'${value.replaceAll("'", "''")}'`;
 
-async function refreshRecommendations(withinTransaction = false) {
+export async function refreshRecommendations(withinTransaction = false) {
     if (!withinTransaction) {
         await run('BEGIN TRANSACTION');
     }
