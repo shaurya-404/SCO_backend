@@ -11,8 +11,6 @@ const __dirname = path.dirname(__filename);
 const simulatorScript = path.resolve(__dirname, '../simulator/simulator.py');
 
 const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
-const workspaceRoles = new Set(['engineer', 'finance', 'leadership']);
-
 const toPublicUser = (user) => ({
   id: user.user_id,
   email: user.email,
@@ -43,8 +41,8 @@ export const register = async (req, res) => {
     if (!email || !password || !name) {
       return res.status(400).json({ error: "Email, password, and name are required" });
     }
-    if (role && !workspaceRoles.has(String(role).toLowerCase())) {
-      return res.status(400).json({ error: 'Workspace role must be engineer, finance, or leadership.' });
+    if (typeof role !== 'string' || !role.trim() || role.trim().length > 120) {
+      return res.status(400).json({ error: 'Job description is required and must be 120 characters or fewer.' });
     }
 
     const existingUser = await CloudModel.getUserByEmail(email);
@@ -53,7 +51,7 @@ export const register = async (req, res) => {
     }
 
     const userId = `usr-${Date.now()}`;
-    const newUser = await CloudModel.createUser(userId, email, password, name, role);
+    const newUser = await CloudModel.createUser(userId, email, password, name, role.trim());
 
     res.status(201).json(createSession(newUser));
   } catch (err) {
@@ -97,9 +95,9 @@ export const updateProfile = async (req, res) => {
     if (
       typeof name !== "string" || !name.trim() || name.trim().length > 120 ||
       typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254 ||
-      typeof role !== "string" || !workspaceRoles.has(role.trim().toLowerCase())
+      typeof role !== "string" || !role.trim() || role.trim().length > 120
     ) {
-      return res.status(400).json({ error: "Provide a valid name, email address, and job description." });
+      return res.status(400).json({ error: "Provide a valid name, email address, and job description of 120 characters or fewer." });
     }
 
     const normalizedEmail = email.trim();
@@ -111,7 +109,7 @@ export const updateProfile = async (req, res) => {
     const updatedUser = await CloudModel.updateUserProfile(req.user.userId, {
       name: name.trim(),
       email: normalizedEmail,
-      role: role.trim().toLowerCase(),
+      role: role.trim(),
     });
     if (!updatedUser) return res.status(404).json({ error: "User not found." });
     res.json(createSession(updatedUser));
