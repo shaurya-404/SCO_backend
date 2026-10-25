@@ -55,7 +55,9 @@ const computeRiskScore = (resource, summary) => {
 };
 
 const computeActionRatio = (resource) => {
-  if (resource.type === 'block-volume' || resource.type === 'public-ip') return 1;
+  if (resource.type === 'block-volume') return 0.52;
+  if (resource.type === 'public-ip') return 0.75;
+  return 0.25;
   const targetVcpu = Math.max(1, Math.floor(Number(resource.vcpu || 0) / 2));
   const targetRam = Math.max(1, Math.floor(Number(resource.ram_gb || 0) / 2));
   const targetCost = targetVcpu * 600 + targetRam * 150 + Number(resource.disk_size_gb || 0) * 4;

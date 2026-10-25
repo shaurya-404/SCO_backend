@@ -2,6 +2,7 @@ import duckdb from 'duckdb';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { buildRecommendations } from '../optimization_engine/core/recommendationEngine.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,7 +15,44 @@ if (!fs.existsSync(dbDir)) {
 const dbPath = process.env.DB_PATH
     ? path.resolve(process.cwd(), process.env.DB_PATH)
     : path.join(dbDir, 'local_metrics.duckdb');
-const db = new duckdb.Database(dbPath);
+
+function resetLocalDatabase() {
+    const walPath = `${dbPath}.wal`;
+    const shmPath = `${dbPath}.shm`;
+    [dbPath, walPath, shmPath].forEach((filePath) => {
+        if (fs.existsSync(filePath)) {
+            fs.rmSync(filePath, { force: true });
+        }
+    });
+}
+
+function createDatabaseConnection() {
+    try {
+        return new duckdb.Database(dbPath);
+    } catch (error) {
+        console.warn('DuckDB connection failed while opening the local database. Resetting the local DB.', error);
+        resetLocalDatabase();
+        return new duckdb.Database(dbPath);
+    }
+}
+
+let db = createDatabaseConnection();
+
+export async function ensureDatabaseConnection() {
+    await new Promise((resolve, reject) => {
+        db.all('SELECT 1 AS ok', (err, rows) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            resolve(rows);
+        });
+    }).catch((error) => {
+        console.warn('DuckDB connection was stale or corrupted. Rebuilding the local database.', error);
+        resetLocalDatabase();
+        db = new duckdb.Database(dbPath);
+    });
+}
 
 const all = (sql, ...params) => new Promise((resolve, reject) => {
     db.all(sql, ...params, (err, rows) => {
@@ -190,6 +228,58 @@ export async function refreshRecommendations(withinTransaction = false) {
             target_configuration, confidence, status
         FROM generated_recommendations`);
         await run(`DROP TABLE generated_recommendations`);
+        const [resources, metricSummaries, existing] = await Promise.all([
+            all(`SELECT * FROM inventory`),
+            all(`SELECT
+                    resource_id, COUNT(*) AS sample_count,
+                    MIN(CAST(timestamp AS TIMESTAMP)) AS first_timestamp,
+                    MAX(CAST(timestamp AS TIMESTAMP)) AS last_timestamp,
+                    MAX(cpu_pct) AS max_cpu, MAX(memory_pct) AS max_memory,
+                    quantile_cont(cpu_pct, 0.95) AS p95_cpu,
+                    quantile_cont(cpu_pct, 0.99) AS p99_cpu,
+                    quantile_cont(memory_pct, 0.95) AS p95_memory,
+                    quantile_cont(memory_pct, 0.99) AS p99_memory,
+                    MAX(disk_pct) AS max_disk, MAX(iops) AS max_iops,
+                    MAX(network_in_mb) AS max_network_in,
+                    MAX(network_out_mb) AS max_network_out
+                FROM metrics GROUP BY resource_id`),
+            all(`SELECT rec_id, status FROM recommendations`),
+        ]);
+        const summaries = new Map(metricSummaries.map((summary) => [summary.resource_id, summary]));
+        const previousStatuses = new Map(existing.map((recommendation) => [
+            recommendation.rec_id,
+            recommendation.status === 'Applied' ? 'Accepted' : recommendation.status,
+        ]));
+        const recommendations = buildRecommendations(resources, summaries);
+
+        await run(`DELETE FROM recommendations`);
+        for (const recommendation of recommendations) {
+            await run(`INSERT INTO recommendations (
+                rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level, status,
+                current_vcpu, current_ram_gb, target_vcpu, target_ram_gb,
+                current_monthly_cost, target_monthly_cost, p95_cpu, p99_cpu,
+                p95_memory, p99_memory, sample_count, history_days
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            recommendation.rec_id,
+            recommendation.resource_id,
+            recommendation.action,
+            recommendation.reason,
+            recommendation.estimated_monthly_saving,
+            recommendation.risk_level,
+            previousStatuses.get(recommendation.rec_id) ?? 'Pending',
+            recommendation.current_vcpu,
+            recommendation.current_ram_gb,
+            recommendation.target_vcpu,
+            recommendation.target_ram_gb,
+            recommendation.current_monthly_cost,
+            recommendation.target_monthly_cost,
+            recommendation.p95_cpu,
+            recommendation.p99_cpu,
+            recommendation.p95_memory,
+            recommendation.p99_memory,
+            recommendation.sample_count,
+            recommendation.history_days);
+        }
         if (!withinTransaction) {
             await run('COMMIT');
         }
@@ -242,6 +332,18 @@ async function ensureGeneratedDataTables() {
         target_configuration VARCHAR,
         confidence DOUBLE,
         status VARCHAR
+        current_vcpu INT,
+        current_ram_gb INT,
+        target_vcpu INT,
+        target_ram_gb INT,
+        current_monthly_cost DOUBLE,
+        target_monthly_cost DOUBLE,
+        p95_cpu DOUBLE,
+        p99_cpu DOUBLE,
+        p95_memory DOUBLE,
+        p99_memory DOUBLE,
+        sample_count INT,
+        history_days DOUBLE
     )`);
     const recommendationColumns = await all(`PRAGMA table_info('recommendations')`);
     if (!recommendationColumns.some((column) => column.name === 'target_configuration')) {
@@ -263,6 +365,28 @@ async function ensureGeneratedDataTables() {
     if (!metricColumns.some((column) => column.name === 'iops')) {
         await run(`ALTER TABLE metrics ADD COLUMN iops DOUBLE`);
     }
+
+    const recommendationColumns = await all(`PRAGMA table_info('recommendations')`);
+    const recommendationMigrations = {
+        current_vcpu: 'INT',
+        current_ram_gb: 'INT',
+        target_vcpu: 'INT',
+        target_ram_gb: 'INT',
+        current_monthly_cost: 'DOUBLE',
+        target_monthly_cost: 'DOUBLE',
+        p95_cpu: 'DOUBLE',
+        p99_cpu: 'DOUBLE',
+        p95_memory: 'DOUBLE',
+        p99_memory: 'DOUBLE',
+        sample_count: 'INT',
+        history_days: 'DOUBLE',
+    };
+    for (const [column, type] of Object.entries(recommendationMigrations)) {
+        if (!recommendationColumns.some((item) => item.name === column)) {
+            await run(`ALTER TABLE recommendations ADD COLUMN ${column} ${type}`);
+        }
+    }
+    await run(`UPDATE recommendations SET status = 'Accepted' WHERE status = 'Applied'`);
 }
 
 export async function importGeneratedData({ force = false } = {}) {
@@ -351,15 +475,29 @@ export async function importGeneratedData({ force = false } = {}) {
 }
 
 export async function initializeDatabase() {
+    await ensureDatabaseConnection();
+
     await run(`CREATE TABLE IF NOT EXISTS users (
         user_id VARCHAR PRIMARY KEY,
-        email VARCHAR UNIQUE NOT NULL,
-        password VARCHAR NOT NULL,
-        name VARCHAR NOT NULL,
+        email VARCHAR,
+        password VARCHAR,
+        name VARCHAR,
         role VARCHAR,
         is_admin BOOLEAN DEFAULT FALSE
     )`);
 
+    const userColumns = await all(`PRAGMA table_info('users')`);
+    if (!userColumns.some((column) => column.name === 'is_admin')) {
+        await run(`ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE`);
+    }
+
+    const users = await all(`SELECT user_id FROM users LIMIT 1`);
+    if (users.length === 0) {
+        await run(`INSERT INTO users (user_id, email, password, name, role, is_admin) VALUES
+            ('usr-1', 'engineer@cloud.com', 'password123', 'Alex (DevOps)', 'engineer', FALSE),
+            ('usr-2', 'finance@cloud.com', 'password123', 'Sarah (Finance)', 'finance', FALSE),
+            ('usr-3', 'admin@cloud.com', 'password123', 'Leadership', 'leadership', TRUE)`);
+    }
     await run(`CREATE TABLE IF NOT EXISTS company_settings (
         company_id VARCHAR PRIMARY KEY,
         name VARCHAR NOT NULL,
@@ -381,14 +519,7 @@ export async function initializeDatabase() {
         ) VALUES ('default', 'Your Company', '', '', '', '', 1000000)`);
     }
 
-    const tables = await all(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'users'`);
-    if (tables.length > 0) {
-        const columns = await all(`PRAGMA table_info('users')`);
-        if (!columns.some((column) => column.name === 'is_admin')) {
-            await run(`ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE`);
-            await run(`UPDATE users SET is_admin = TRUE WHERE user_id = 'usr-3' AND email = 'admin@cloud.com' AND role = 'leadership'`);
-        }
-    }
+    await run(`UPDATE users SET is_admin = TRUE WHERE user_id = 'usr-3' AND email = 'admin@cloud.com' AND role = 'leadership'`);
 
     const importResult = await importGeneratedData();
     if (importResult.imported) {
