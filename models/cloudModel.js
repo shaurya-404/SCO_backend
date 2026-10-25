@@ -94,6 +94,7 @@ export const CloudModel = {
         else resolve(rows);
       });
     });
+  },
   getMetricsForResource: (id, days = 30) => {
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     return queryAll(
