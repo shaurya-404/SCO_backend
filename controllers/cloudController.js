@@ -229,8 +229,30 @@ export const getResourceById = async (req, res) => {
 
 export const getResourceMetrics = async (req, res) => {
   try {
-    const metrics = await CloudModel.getMetricsForResource(req.params.id);
+    const requestedDays = Number(req.query.days ?? 30);
+    if (![7, 14, 30, 90].includes(requestedDays)) {
+      return res.status(400).json({ error: "Days must be one of 7, 14, 30, or 90." });
+    }
+    const metrics = await CloudModel.getMetricsForResource(req.params.id, requestedDays);
     res.json(metrics);
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const getFleetUtilization = async (req, res) => {
+  try {
+    const days = Number(req.query.days ?? 30);
+    if (![7, 14, 30, 90].includes(days)) {
+      return res.status(400).json({ error: "Days must be one of 7, 14, 30, or 90." });
+    }
+    const filters = {
+      region: typeof req.query.region === 'string' ? req.query.region : '',
+      environment: typeof req.query.environment === 'string' ? req.query.environment : '',
+      team: typeof req.query.team === 'string' ? req.query.team : '',
+    };
+    const utilization = await CloudModel.getFleetUtilization(days, filters);
+    res.json(utilization);
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -309,9 +331,19 @@ export const regenerateMetricsAndRecommendations = async (req, res) => {
 
 export const updateRecommendationAction = async (req, res) => {
   try {
-    const { status } = req.body;
-    const result = await CloudModel.updateRecommendationStatus(req.params.id, status || 'Applied');
-    res.json({ success: true, ...result });
+    const { status } = req.body ?? {};
+    const statusMap = {
+      Accepted: 'Accepted',
+      Applied: 'Accepted',
+      Dismissed: 'Dismissed',
+      Implemented: 'Implemented',
+    };
+    if (!statusMap[status]) {
+      return res.status(400).json({ error: "Status must be Accepted, Dismissed, or Implemented." });
+    }
+    const result = await CloudModel.updateRecommendationStatus(req.params.id, statusMap[status]);
+    if (!result.updated) return res.status(404).json({ error: "Recommendation not found." });
+    res.json({ success: true, ...result, status: statusMap[status] });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -319,8 +351,9 @@ export const updateRecommendationAction = async (req, res) => {
 
 export const applyRecommendation = async (req, res) => {
   try {
-    const result = await CloudModel.updateRecommendationStatus(req.params.id, 'Applied');
-    res.json({ success: true, ...result });
+    const result = await CloudModel.updateRecommendationStatus(req.params.id, 'Accepted');
+    if (!result.updated) return res.status(404).json({ error: "Recommendation not found." });
+    res.json({ success: true, ...result, status: 'Accepted' });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -329,7 +362,8 @@ export const applyRecommendation = async (req, res) => {
 export const dismissRecommendation = async (req, res) => {
   try {
     const result = await CloudModel.updateRecommendationStatus(req.params.id, 'Dismissed');
-    res.json({ success: true, ...result });
+    if (!result.updated) return res.status(404).json({ error: "Recommendation not found." });
+    res.json({ success: true, ...result, status: 'Dismissed' });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -339,7 +373,7 @@ export const batchApplyRecommendations = async (req, res) => {
   try {
     const { rec_ids } = req.body;
     const savings = await CloudModel.getRecommendationSavings(rec_ids);
-    const result = await CloudModel.batchUpdateRecommendations(rec_ids, 'Applied');
+    const result = await CloudModel.batchUpdateRecommendations(rec_ids, 'Accepted');
     res.json({ success: true, applied_count: result.updated, total_estimated_savings: savings });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -389,12 +423,14 @@ export const getCostForecast = async (req, res) => {
 export const getCostBeforeVsAfter = async (req, res) => {
   try {
     const summary = await CloudModel.getCostSummary();
-    const current = Number(summary?.total_current_spend || 0);
+    const current = Number(summary?.total_current_spend ?? 0);
     const savings = await CloudModel.getPotentialSavings();
     res.json({
       current_monthly_spend: current,
       optimized_monthly_spend: Math.max(0, current - savings),
-      projected_monthly_savings: savings
+      projected_monthly_savings: savings,
+      included_statuses: ['Pending', 'Accepted', 'Implemented'],
+      note: 'Current spend remains based on inventory pricing. Projected savings include all non-dismissed recommendations and do not represent realized bill reductions.',
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
