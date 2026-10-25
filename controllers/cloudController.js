@@ -2,6 +2,7 @@ import jwt from 'jsonwebtoken';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import db from '../database/connection.js';
 import { CloudModel } from '../models/cloudModel.js';
 import { createOptimizationEngine, mountReasoner } from '../optimization_engine/index.js';
 
@@ -10,6 +11,7 @@ const __dirname = path.dirname(__filename);
 const simulatorScript = path.resolve(__dirname, '../simulator/simulator.py');
 
 const getErrorMessage = (error) => error instanceof Error ? error.message : String(error);
+const workspaceRoles = new Set(['engineer', 'finance', 'leadership']);
 
 const toPublicUser = (user) => ({
   id: user.user_id,
@@ -40,6 +42,9 @@ export const register = async (req, res) => {
     const { email, password, name, role } = req.body ?? {};
     if (!email || !password || !name) {
       return res.status(400).json({ error: "Email, password, and name are required" });
+    }
+    if (role && !workspaceRoles.has(String(role).toLowerCase())) {
+      return res.status(400).json({ error: 'Workspace role must be engineer, finance, or leadership.' });
     }
 
     const existingUser = await CloudModel.getUserByEmail(email);
@@ -92,7 +97,7 @@ export const updateProfile = async (req, res) => {
     if (
       typeof name !== "string" || !name.trim() || name.trim().length > 120 ||
       typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254 ||
-      typeof role !== "string" || !role.trim() || role.trim().length > 120
+      typeof role !== "string" || !workspaceRoles.has(role.trim().toLowerCase())
     ) {
       return res.status(400).json({ error: "Provide a valid name, email address, and job description." });
     }
@@ -106,7 +111,7 @@ export const updateProfile = async (req, res) => {
     const updatedUser = await CloudModel.updateUserProfile(req.user.userId, {
       name: name.trim(),
       email: normalizedEmail,
-      role: role.trim(),
+      role: role.trim().toLowerCase(),
     });
     if (!updatedUser) return res.status(404).json({ error: "User not found." });
     res.json(createSession(updatedUser));
@@ -135,6 +140,8 @@ export const updateCompanyDetails = async (req, res) => {
       typeof industry !== "string" || industry.length > 120 ||
       typeof contact_email !== "string" || contact_email.length > 254 ||
       typeof address !== "string" || address.length > 500 ||
+      (req.body.monthly_budget !== undefined &&
+        (!Number.isFinite(Number(req.body.monthly_budget)) || Number(req.body.monthly_budget) < 0)) ||
       (contact_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact_email.trim()))
     ) {
       return res.status(400).json({ error: "Provide valid company details within the allowed field lengths." });
@@ -155,6 +162,9 @@ export const updateCompanyDetails = async (req, res) => {
       industry: industry.trim(),
       contact_email: contact_email.trim(),
       address: address.trim(),
+      monthly_budget: req.body.monthly_budget === undefined
+        ? (await CloudModel.getCompanyDetails()).monthly_budget
+        : Number(req.body.monthly_budget),
     });
     if (!company) return res.status(404).json({ error: "Company details have not been configured." });
     res.json(company);
@@ -176,6 +186,32 @@ export const getInventoryStats = async (req, res) => {
   try {
     const stats = await CloudModel.getInventoryStats();
     res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: getErrorMessage(err) });
+  }
+};
+
+export const getFleetMetrics = async (_req, res) => {
+  try {
+    const resources = await CloudModel.getFleetUtilization();
+    const measured = resources.filter((resource) => resource.sample_count);
+    const mean = (key) => measured.length
+      ? measured.reduce((sum, resource) => sum + Number(resource[key] || 0), 0) / measured.length
+      : 0;
+    res.json({
+      summary: {
+        resource_count: resources.length,
+        measured_resource_count: measured.length,
+        avg_cpu_pct: mean('avg_cpu'),
+        avg_memory_pct: mean('avg_memory'),
+        avg_disk_pct: mean('avg_disk'),
+        avg_network_in_mb: mean('avg_network_in'),
+        avg_network_out_mb: mean('avg_network_out'),
+        high_cpu_resources: measured.filter((resource) => resource.p95_cpu >= 80).length,
+        high_memory_resources: measured.filter((resource) => resource.p95_memory >= 80).length,
+      },
+      resources,
+    });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
   }
@@ -267,7 +303,7 @@ export const regenerateMetricsAndRecommendations = async (req, res) => {
     const { seed = Date.now() } = req.body ?? {};
 
     await new Promise((resolve, reject) => {
-      execFile('python3', [simulatorScript, '--seed', String(seed)], {
+      execFile(process.platform === 'win32' ? 'python' : 'python3', [simulatorScript, '--seed', String(seed)], {
         cwd: path.dirname(simulatorScript),
         timeout: 120000,
       }, (error, stdout, stderr) => {
@@ -367,12 +403,19 @@ export const getCostBreakdown = async (req, res) => {
 export const getCostForecast = async (req, res) => {
   try {
     const summary = await CloudModel.getCostSummary();
-    const current = Number(summary?.total_current_spend ?? 0);
+    const current = Number(summary?.total_current_spend || 0);
+    const utilization = await CloudModel.getWeeklyUtilizationChange();
+    const recent = Number(utilization?.recent_usage || 0);
+    const previous = Number(utilization?.previous_usage || 0);
+    const change = previous > 0 ? Math.max(-0.2, Math.min((recent - previous) / previous, 0.2)) : 0;
+    const project = (days) => Math.round(current * Math.max(0, 1 + change * days / 30));
     res.json({
       current_monthly_spend: current,
-      forecast_30_days: Math.round(current * 1.03),
-      forecast_60_days: Math.round(current * 1.06),
-      forecast_90_days: Math.round(current * 1.10)
+      forecast_30_days: project(30),
+      forecast_60_days: project(60),
+      forecast_90_days: project(90),
+      utilization_change_pct: Number((change * 100).toFixed(1)),
+      method: 'Linear extrapolation of the last 7 days versus the previous 7 days of cost-weighted utilization; capped at 20% change per 30 days.',
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -398,13 +441,72 @@ export const getCostBeforeVsAfter = async (req, res) => {
 
 export const getAlerts = async (req, res) => {
   try {
-    const anomalies = await CloudModel.getAnomalies();
-    const alerts = anomalies.map((a, i) => ({
-      alert_id: `alt-${i + 1}`,
-      severity: a.cpu_pct > 95 ? 'High' : 'Medium',
-      message: `Resource ${a.resource_id} exhibited high CPU/memory utilization (${a.cpu_pct}% CPU).`,
-      timestamp: a.timestamp
+    const [anomalies, fleet, cost, budget, utilization] = await Promise.all([
+      CloudModel.getAnomalies(),
+      CloudModel.getFleetUtilization(),
+      CloudModel.getCostSummary(),
+      CloudModel.getMonthlyBudget(),
+      CloudModel.getWeeklyUtilizationChange(),
+    ]);
+    const latestByResource = new Map();
+    for (const anomaly of anomalies) {
+      if (!latestByResource.has(anomaly.resource_id)) latestByResource.set(anomaly.resource_id, anomaly);
+    }
+    const alerts = [...latestByResource.values()].map((anomaly) => ({
+      alert_id: `anomaly-${anomaly.resource_id}`,
+      type: 'utilization-anomaly',
+      severity: anomaly.cpu_pct > 95 || anomaly.memory_pct > 95 ? 'High' : 'Medium',
+      message: `${anomaly.resource_id} reached ${anomaly.cpu_pct}% CPU and ${anomaly.memory_pct}% memory.`,
+      reason: anomaly.is_anomaly === 'true'
+        ? 'The simulator marked this interval as an anomalous production spike.'
+        : 'A measured CPU or memory value exceeded 90%.',
+      timestamp: anomaly.timestamp,
     }));
+    const monthlySpend = Number(cost?.total_current_spend || 0);
+    const monthlyBudget = Number(budget?.monthly_budget || 0);
+    if (monthlyBudget > 0 && monthlySpend >= monthlyBudget) {
+      alerts.push({
+        alert_id: 'budget-overrun',
+        type: 'budget-overrun',
+        severity: 'High',
+        message: `Current estimated monthly spend (${monthlySpend.toFixed(0)}) exceeds the workspace budget (${monthlyBudget.toFixed(0)}).`,
+        reason: 'Inventory monthly prices are above the configured workspace budget.',
+        timestamp: new Date().toISOString(),
+      });
+    } else if (monthlyBudget > 0 && monthlySpend >= monthlyBudget * 0.9) {
+      alerts.push({
+        alert_id: 'budget-near-limit',
+        type: 'budget-risk',
+        severity: 'Medium',
+        message: `Estimated monthly spend is at ${Math.round(monthlySpend / monthlyBudget * 100)}% of the workspace budget.`,
+        reason: 'Inventory monthly prices are within 10% of the configured workspace budget.',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    const recentUsage = Number(utilization?.recent_usage || 0);
+    const previousUsage = Number(utilization?.previous_usage || 0);
+    if (previousUsage > 0 && recentUsage > previousUsage * 1.15) {
+      alerts.push({
+        alert_id: 'usage-cost-trend',
+        type: 'estimated-cost-trend',
+        severity: 'Medium',
+        message: 'Cost-weighted utilization has risen by more than 15% week over week.',
+        reason: 'This is an estimated spend-pressure signal derived from utilization and listed monthly prices, not a cloud billing feed.',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    for (const resource of fleet) {
+      if (Number(resource.p95_cpu) >= 85 || Number(resource.p95_memory) >= 85) {
+        alerts.push({
+          alert_id: `capacity-${resource.resource_id}`,
+          type: 'capacity-risk',
+          severity: 'High',
+          message: `${resource.resource_id} is trending toward capacity limits (p95 CPU ${Number(resource.p95_cpu).toFixed(1)}%, memory ${Number(resource.p95_memory).toFixed(1)}%).`,
+          reason: 'One or more 95th-percentile utilization metrics is at least 85%.',
+          timestamp: resource.latest_timestamp,
+        });
+      }
+    }
     res.json(alerts);
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -413,10 +515,20 @@ export const getAlerts = async (req, res) => {
 
 export const getForecast = async (req, res) => {
   try {
+    const [utilization, forecast] = await Promise.all([
+      CloudModel.getWeeklyUtilizationChange(),
+      CloudModel.getCostSummary(),
+    ]);
+    const recent = Number(utilization?.recent_usage || 0);
+    const previous = Number(utilization?.previous_usage || 0);
+    const growth = previous > 0 ? Math.max(-20, Math.min(((recent - previous) / previous) * 100, 20)) : 0;
     res.json({
-      trend: "increasing",
-      projected_growth_rate_pct: 3.5,
-      recommendation: "Review auto-scaling policies for dev clusters and terminate orphaned storage volumes."
+      trend: growth > 1 ? 'increasing' : growth < -1 ? 'decreasing' : 'stable',
+      projected_growth_rate_pct: Number(growth.toFixed(1)),
+      recommendation: Number(forecast?.total_current_spend || 0) > 0
+        ? 'Projection compares cost-weighted utilization in the latest week with the prior week. Validate against actual provider billing before budgeting.'
+        : 'No inventory cost data is available to create a spend projection.',
+      method: 'Cost-weighted utilization trend; this demo has no provider billing history.',
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -425,58 +537,45 @@ export const getForecast = async (req, res) => {
 
 export const runOptimizationEngine = async (req, res) => {
   try {
-    const { maxBudget = 250000, provider = 'local', aiReasoning = false } = req.body ?? {};
-    const budget = Number(maxBudget);
-    if (!Number.isFinite(budget) || budget < 0) {
-      return res.status(400).json({ error: "maxBudget must be a non-negative number." });
+    const { maxBudget, provider = 'local', aiReasoning = false } = req.body ?? {};
+    const budget = maxBudget === undefined ? 250000 : Number(maxBudget);
+    if (!Number.isFinite(budget) || budget <= 0) {
+      return res.status(400).json({ error: 'maxBudget must be a positive finite number.' });
     }
 
-    const candidates = (await CloudModel.getAllRecommendations())
-      .filter((item) => item.status !== 'Dismissed')
-      .sort((left, right) => right.estimated_monthly_saving - left.estimated_monthly_saving);
-    let budgetUsed = 0;
-    const selected = [];
-    const deferred = [];
-    for (const candidate of candidates) {
-      if (budgetUsed + candidate.estimated_monthly_saving <= budget) {
-        selected.push(candidate);
-        budgetUsed += candidate.estimated_monthly_saving;
-      } else {
-        deferred.push(candidate);
+    const [resources, metricRows] = await Promise.all([
+      CloudModel.getAllInventory(),
+      new Promise((resolve, reject) => {
+        db.all(`SELECT * FROM metrics ORDER BY resource_id, timestamp`, (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows || []);
+        });
+      }),
+    ]);
+
+    const metricsByResource = {};
+    for (const row of metricRows) {
+      if (!metricsByResource[row.resource_id]) {
+        metricsByResource[row.resource_id] = [];
       }
+      metricsByResource[row.resource_id].push(row);
     }
-    const recommendations = selected.map((item) => ({
-      ...item,
-      estimated_savings: item.estimated_monthly_saving,
-      utilization: {
-        p95Cpu: item.p95_cpu,
-        p99Cpu: item.p99_cpu,
-        p95Memory: item.p95_memory,
-        p99Memory: item.p99_memory,
-      },
-    }));
-    const result = {
-      engine: 'peak-aware-target-recommendation-engine',
-      summary: {
-        objective: 'select the highest monthly savings that fit the requested savings budget',
-        candidate_count: candidates.length,
-        selected_count: recommendations.length,
-        total_savings: Number(budgetUsed.toFixed(2)),
-        budget_used: Number(budgetUsed.toFixed(2)),
-        max_budget: budget,
-      },
-      recommendations,
-      deferred_recommendations: deferred,
-    };
+
+    const engine = createOptimizationEngine({
+      maxBudget: budget,
+      provider,
+    });
+
+    const result = engine.run({ resources, metricsByResource });
 
     if (aiReasoning && provider !== 'local') {
       try {
-        const reasoner = mountReasoner(createOptimizationEngine({ provider }), provider, {
+        const attachedEngine = mountReasoner(engine, provider, {
           apiKey: provider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.OPENAI_API_KEY,
         });
-        result.ai = await reasoner.ai.reason({
+        result.ai = await attachedEngine.ai.reason({
           recommendations: result.recommendations,
-          summary: { totalSavings: result.summary.total_savings },
+          summary: result.summary,
         });
       } catch (reasoningError) {
         result.ai = {
@@ -496,14 +595,47 @@ export const runOptimizationEngine = async (req, res) => {
 
 export const runSimulatorWhatIf = async (req, res) => {
   try {
-    const { shutdownDevAtNight, rightsizeUnderutilized } = req.body;
-    let simulatedSavings = 0;
-    if (shutdownDevAtNight) simulatedSavings += 1450;
-    if (rightsizeUnderutilized) simulatedSavings += 2300;
+    const { shutdownDevAtNight = false, rightsizeUnderutilized = false } = req.body ?? {};
+    if (typeof shutdownDevAtNight !== 'boolean' || typeof rightsizeUnderutilized !== 'boolean') {
+      return res.status(400).json({ error: 'Scenario options must be boolean values.' });
+    }
+    const recommendations = await CloudModel.getAllRecommendations();
+    const byResource = new Map();
+    for (const recommendation of recommendations) {
+      if (recommendation.status !== 'Pending') continue;
+      const key = recommendation.resource_id;
+      const current = byResource.get(key) ?? {
+        cost: Number(recommendation.monthly_cost || 0),
+        shutdownSaving: 0,
+        rightsizeSaving: 0,
+        actions: [],
+      };
+      if (shutdownDevAtNight && recommendation.rec_id.startsWith('schedule-')) {
+        current.shutdownSaving += Number(recommendation.estimated_monthly_saving || 0);
+        current.actions.push(recommendation.action);
+      }
+      if (rightsizeUnderutilized && recommendation.rec_id.startsWith('rightsize-')) {
+        current.rightsizeSaving += Number(recommendation.estimated_monthly_saving || 0);
+        current.actions.push(recommendation.action);
+      }
+      byResource.set(key, current);
+    }
+    const selected = [...byResource.values()].filter((item) => item.actions.length);
+    const breakdown = selected.reduce((result, item) => {
+      const requested = item.shutdownSaving + item.rightsizeSaving;
+      const cap = item.cost > 0 ? item.cost : requested;
+      const ratio = requested > cap ? cap / requested : 1;
+      result.shutdownDevAtNight += item.shutdownSaving * ratio;
+      result.rightsizeUnderutilized += item.rightsizeSaving * ratio;
+      return result;
+    }, { shutdownDevAtNight: 0, rightsizeUnderutilized: 0 });
+    const simulatedSavings = breakdown.shutdownDevAtNight + breakdown.rightsizeUnderutilized;
 
     res.json({
       simulatedMonthlySavings: simulatedSavings,
-      message: "Simulation completed successfully based on active parameters."
+      resourceCount: selected.length,
+      breakdown,
+      message: `Estimated from ${selected.length} eligible resources and their pending recommendation savings. Schedules and resizing are proposals only.`,
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -512,9 +644,25 @@ export const runSimulatorWhatIf = async (req, res) => {
 
 export const explainAI = async (req, res) => {
   try {
-    const { resource_id, metrics_summary } = req.body;
+    const { resource_id } = req.body ?? {};
+    if (typeof resource_id !== 'string' || !resource_id.trim()) {
+      return res.status(400).json({ error: 'A resource_id is required.' });
+    }
+    const resource = await CloudModel.getResourceById(resource_id.trim());
+    if (!resource) return res.status(404).json({ error: 'Resource not found.' });
+    const [percentiles, metrics, recommendations] = await Promise.all([
+      CloudModel.getResourcePercentiles(resource.resource_id),
+      CloudModel.getMetricsForResource(resource.resource_id),
+      CloudModel.getAllRecommendations(),
+    ]);
+    const recommendation = recommendations.find((item) => item.resource_id === resource.resource_id && item.status === 'Pending');
+    const latest = metrics.at(-1);
+    const reason = recommendation
+      ? `${recommendation.action}. ${recommendation.reason} Estimated saving: ${recommendation.estimated_monthly_saving} per month; risk: ${recommendation.risk_level}.`
+      : 'No pending optimization recommendation meets the current safety thresholds for this resource.';
     res.json({
-      explanation: `AI Cost Analysis for ${resource_id || 'Target Resource'}: Based on metrics (${metrics_summary || 'low utilization'}), this asset is over-provisioned and can be safely rightsized or terminated to reduce monthly burn rate.`
+      provider: 'local-rules',
+      explanation: `${resource.name} (${resource.resource_id}) costs ${resource.monthly_cost} per month. p95 CPU is ${Number(percentiles?.p95_cpu || 0).toFixed(1)}%, p99 CPU ${Number(percentiles?.p99_cpu || 0).toFixed(1)}%, p95 memory ${Number(percentiles?.p95_memory || 0).toFixed(1)}%, and p99 memory ${Number(percentiles?.p99_memory || 0).toFixed(1)}%. Latest sample: ${latest ? `${latest.cpu_pct}% CPU, ${latest.memory_pct}% memory` : 'unavailable'}. ${reason} Estimates use illustrative INR pricing and are not a cloud control action.`
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });
@@ -524,20 +672,39 @@ export const explainAI = async (req, res) => {
 export const exportData = async (req, res) => {
   try {
     const format = req.params.format;
+    if (!['terraform', 'csv', 'bash'].includes(format)) {
+      return res.status(400).json({ error: 'Supported export formats are terraform, csv, and bash.' });
+    }
+    const [resources, recommendations] = await Promise.all([
+      CloudModel.getAllInventory(),
+      CloudModel.getAllRecommendations(),
+    ]);
+    const pending = recommendations.filter((item) => item.status === 'Pending');
+    const quoteCsv = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`;
     if (format === 'terraform') {
+      const values = pending.map((item) => ({
+        resource_id: item.resource_id,
+        action: item.action,
+        target_configuration: item.target_configuration,
+        estimated_monthly_saving_inr: item.estimated_monthly_saving,
+        risk_level: item.risk_level,
+      }));
       res.json({
         format: 'terraform',
-        content: 'resource "aws_instance" "optimized_vm" { ami = "ami-0c55b159cbfafe1f0" instance_type = "t3.small" }'
+        content: `# Review-only output. This does not modify cloud resources.\nlocals {\n  smartcloud_recommendations = jsondecode(${JSON.stringify(JSON.stringify(values))})\n}`,
       });
     } else if (format === 'csv') {
       res.json({
         format: 'csv',
-        content: 'resource_id,name,type,monthly_cost\nvm-cluster-1001,instance-1-prod,VM,3820.0'
+        content: [
+          ['resource_id', 'name', 'type', 'region', 'environment', 'owner', 'vcpu', 'ram_gb', 'disk_size_gb', 'monthly_cost_inr', 'attached_to'],
+          ...resources.map((item) => [item.resource_id, item.name, item.type, item.region, item.environment, item.owner, item.vcpu, item.ram_gb, item.disk_size_gb, item.monthly_cost, item.attached_to]),
+        ].map((row) => row.map(quoteCsv).join(',')).join('\n'),
       });
     } else {
       res.json({
-        format: format || 'json',
-        content: '# Automated remediation script\naws ec2 modify-instance-attribute --instance-id vm-cluster-1001 --instance-type t3.small'
+        format,
+        content: `#!/usr/bin/env bash\n# Review-only report. No cloud commands are run.\ncat <<'SMARTCLOUD_RECOMMENDATIONS'\n${pending.map((item) => `${item.resource_id}: ${item.action}; target=${item.target_configuration || 'review'}; estimated_saving_inr=${item.estimated_monthly_saving}; risk=${item.risk_level}`).join('\n')}\nSMARTCLOUD_RECOMMENDATIONS`,
       });
     }
   } catch (err) {
@@ -547,10 +714,19 @@ export const exportData = async (req, res) => {
 
 export const getSustainability = async (req, res) => {
   try {
+    const savings = Number(await CloudModel.getPotentialSavings());
+    const energySaved = Number((savings * 0.02).toFixed(1));
+    const carbonSaved = Number((energySaved * 0.7).toFixed(1));
     res.json({
-      carbon_saved_kg_co2e_per_month: 412.5,
-      equivalent_trees_planted: 19,
-      energy_saved_kwh: 950.0
+      carbon_saved_kg_co2e_per_month: carbonSaved,
+      equivalent_trees_planted: Number((carbonSaved * 12 / 22).toFixed(1)),
+      energy_saved_kwh: energySaved,
+      assumptions: {
+        kwh_per_inr_saved: 0.02,
+        kg_co2e_per_kwh: 0.7,
+        kg_co2e_per_tree_year: 22,
+        basis: 'Illustrative factors applied to pending estimated monthly savings; not measured power or a carbon-accounting result.',
+      },
     });
   } catch (err) {
     res.status(500).json({ error: getErrorMessage(err) });

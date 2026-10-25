@@ -49,7 +49,7 @@ const computeIdleScore = (summary) => {
 const computeRiskScore = (resource, summary) => {
   const cpuRisk = clamp(summary.p99Cpu / 100, 0, 1);
   const memoryRisk = clamp(summary.p99Memory / 100, 0, 1);
-  const orphanPenalty = resource.attached_to ? 0 : 0.5;
+  const orphanPenalty = resource.type !== 'VM' && !resource.attached_to ? 0.5 : 0;
   const vmPenalty = resource.type === 'VM' ? 0.15 : 0;
   return clamp(cpuRisk * 0.45 + memoryRisk * 0.35 + orphanPenalty + vmPenalty, 0, 1);
 };
@@ -58,6 +58,12 @@ const computeActionRatio = (resource) => {
   if (resource.type === 'block-volume') return 0.52;
   if (resource.type === 'public-ip') return 0.75;
   return 0.25;
+  const targetVcpu = Math.max(1, Math.floor(Number(resource.vcpu || 0) / 2));
+  const targetRam = Math.max(1, Math.floor(Number(resource.ram_gb || 0) / 2));
+  const targetCost = targetVcpu * 600 + targetRam * 150 + Number(resource.disk_size_gb || 0) * 4;
+  return Number(resource.monthly_cost) > 0
+    ? Math.max(0, (Number(resource.monthly_cost) - targetCost) / Number(resource.monthly_cost))
+    : 0;
 };
 
 const buildRecommendationText = (resource, summary) => {
@@ -83,6 +89,9 @@ export const buildRecommendationCandidates = (resources = [], metricsByResource 
       const actionRatio = computeActionRatio(resource);
 
       const savings = Number(resource.monthly_cost || 0) * actionRatio;
+      const targetConfiguration = resource.type === 'VM'
+        ? `${Math.max(1, Math.floor(Number(resource.vcpu || 0) / 2))} vCPU / ${Math.max(1, Math.floor(Number(resource.ram_gb || 0) / 2))} GB RAM`
+        : null;
       const efficiency = clamp((idleScore * 0.7) + ((1 - riskScore) * 0.3), 0, 1);
       const objectiveCoefficient = savings * (0.4 + efficiency);
 
@@ -99,6 +108,7 @@ export const buildRecommendationCandidates = (resources = [], metricsByResource 
         }
 
         return (
+          Number(resource.vcpu || 0) >= 4 &&
           summary.p95Cpu <= 20 &&
           summary.p99Cpu <= 30 &&
           summary.p95Memory <= 50 &&
@@ -131,6 +141,8 @@ export const buildRecommendationCandidates = (resources = [], metricsByResource 
         },
         idleScore,
         riskScore,
+        riskLevel: riskScore < 0.3 ? 'Low' : riskScore < 0.6 ? 'Medium' : 'High',
+        targetConfiguration,
         efficiency,
         action: resource.type === 'VM' ? 'rightsizing' : 'release-unused-resource',
         reason: buildRecommendationText(resource, summary),

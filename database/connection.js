@@ -76,6 +76,158 @@ export async function refreshRecommendations(withinTransaction = false) {
         await run('BEGIN TRANSACTION');
     }
     try {
+        await run(`CREATE OR REPLACE TEMP TABLE generated_recommendations AS
+            WITH metric_summary AS (
+            SELECT
+                resource_id,
+                COUNT(*) AS sample_count,
+                MAX(cpu_pct) AS max_cpu,
+                MAX(memory_pct) AS max_memory,
+                quantile_cont(cpu_pct, 0.95) AS p95_cpu,
+                quantile_cont(cpu_pct, 0.99) AS p99_cpu,
+                quantile_cont(memory_pct, 0.95) AS p95_memory,
+                quantile_cont(memory_pct, 0.99) AS p99_memory,
+                MAX(disk_pct) AS max_disk,
+                MAX(iops) AS max_iops,
+                MAX(network_in_mb) AS max_network_in,
+                MAX(network_out_mb) AS max_network_out,
+                quantile_cont(cpu_pct, 0.95) FILTER (
+                    WHERE EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) >= 20
+                       OR EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) < 8
+                       OR EXTRACT(isodow FROM CAST(timestamp AS TIMESTAMP)) >= 6
+                ) AS off_hours_p95_cpu,
+                quantile_cont(memory_pct, 0.95) FILTER (
+                    WHERE EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) >= 20
+                       OR EXTRACT(hour FROM CAST(timestamp AS TIMESTAMP)) < 8
+                       OR EXTRACT(isodow FROM CAST(timestamp AS TIMESTAMP)) >= 6
+                ) AS off_hours_p95_memory
+            FROM metrics
+            GROUP BY resource_id
+        ),
+        candidates AS (
+            SELECT
+                'orphan-' || inventory.resource_id AS rec_id,
+                inventory.resource_id,
+                CASE inventory.type
+                    WHEN 'block-volume' THEN 'Remove unattached block volume'
+                    ELSE 'Release unattached public IP'
+                END AS action,
+                'No attachment and zero disk, I/O, and network activity across at least 14 days of recorded metrics.'
+                    AS reason,
+                ROUND(inventory.monthly_cost, 2) AS estimated_monthly_saving,
+                'Safe' AS risk_level,
+                NULL::VARCHAR AS target_configuration,
+                95.0 AS confidence
+            FROM inventory
+            JOIN metric_summary USING (resource_id)
+            WHERE inventory.type IN ('block-volume', 'public-ip')
+                AND NULLIF(TRIM(inventory.attached_to), '') IS NULL
+                AND inventory.monthly_cost > 0
+                AND metric_summary.sample_count >= 1344
+                AND metric_summary.max_disk = 0
+                AND metric_summary.max_iops = 0
+                AND metric_summary.max_network_in = 0
+                AND metric_summary.max_network_out = 0
+
+            UNION ALL
+
+            SELECT
+                'rightsize-' || inventory.resource_id AS rec_id,
+                inventory.resource_id,
+                'Right-size VM to '
+                    || CAST(GREATEST(1, CAST(inventory.vcpu / 2 AS INTEGER)) AS VARCHAR)
+                    || ' vCPU / '
+                    || CAST(GREATEST(1, CAST(inventory.ram_gb / 2 AS INTEGER)) AS VARCHAR)
+                    || ' GB RAM' AS action,
+                'Utilization across '
+                    || CAST(metric_summary.sample_count AS VARCHAR)
+                    || ' recorded samples is consistently low (p95 CPU '
+                    || CAST(ROUND(metric_summary.p95_cpu, 1) AS VARCHAR)
+                    || '%, p99 CPU '
+                    || CAST(ROUND(metric_summary.p99_cpu, 1) AS VARCHAR)
+                    || '%, p95 memory '
+                    || CAST(ROUND(metric_summary.p95_memory, 1) AS VARCHAR)
+                    || '%, p99 memory '
+                    || CAST(ROUND(metric_summary.p99_memory, 1) AS VARCHAR)
+                    || '%). Proposed target halves the current vCPU and memory; verify workload and provider pricing before rollout.'
+                    AS reason,
+                ROUND(GREATEST(0,
+                    inventory.monthly_cost - (
+                        GREATEST(1, CAST(inventory.vcpu / 2 AS INTEGER)) * 600
+                        + GREATEST(1, CAST(inventory.ram_gb / 2 AS INTEGER)) * 150
+                        + inventory.disk_size_gb * 4
+                    )
+                ), 2) AS estimated_monthly_saving,
+                CASE
+                    WHEN metric_summary.p99_cpu <= 15 AND metric_summary.p99_memory <= 40 THEN 'Low'
+                    ELSE 'Medium'
+                END AS risk_level,
+                CAST(GREATEST(1, CAST(inventory.vcpu / 2 AS INTEGER)) AS VARCHAR)
+                    || ' vCPU / '
+                    || CAST(GREATEST(1, CAST(inventory.ram_gb / 2 AS INTEGER)) AS VARCHAR)
+                    || ' GB RAM' AS target_configuration,
+                CASE
+                    WHEN metric_summary.p99_cpu <= 15 AND metric_summary.p99_memory <= 40 THEN 90.0
+                    ELSE 75.0
+                END AS confidence
+            FROM inventory
+            JOIN metric_summary USING (resource_id)
+            WHERE inventory.type = 'VM'
+                AND metric_summary.sample_count >= 1344
+                AND metric_summary.p95_cpu <= 20
+                AND metric_summary.p99_cpu <= 30
+                AND metric_summary.p95_memory <= 50
+                AND metric_summary.p99_memory <= 60
+                AND metric_summary.max_cpu <= 90
+                AND metric_summary.max_memory <= 90
+                AND inventory.vcpu >= 4
+
+            UNION ALL
+
+            SELECT
+                'schedule-' || inventory.resource_id AS rec_id,
+                inventory.resource_id,
+                'Schedule off-hours shutdown (8 PM–8 AM)' AS action,
+                'Recorded off-hours and weekend p95 utilization is low (CPU '
+                    || CAST(ROUND(metric_summary.off_hours_p95_cpu, 1) AS VARCHAR)
+                    || '%, memory '
+                    || CAST(ROUND(metric_summary.off_hours_p95_memory, 1) AS VARCHAR)
+                    || '%). Schedule only after confirming no overnight jobs or availability requirements.'
+                    AS reason,
+                ROUND(inventory.monthly_cost * 0.5, 2) AS estimated_monthly_saving,
+                'Medium' AS risk_level,
+                'Weekdays 8 PM–8 AM; weekends: stopped' AS target_configuration,
+                70.0 AS confidence
+            FROM inventory
+            JOIN metric_summary USING (resource_id)
+            WHERE inventory.type = 'VM'
+                AND inventory.environment IN ('dev', 'staging')
+                AND metric_summary.sample_count >= 1344
+                AND metric_summary.off_hours_p95_cpu <= 10
+                AND metric_summary.off_hours_p95_memory <= 30
+            )
+            SELECT
+                candidates.rec_id,
+                candidates.resource_id,
+                candidates.action,
+                candidates.reason,
+                candidates.estimated_monthly_saving,
+                candidates.risk_level,
+                candidates.target_configuration,
+                candidates.confidence,
+                COALESCE(recommendations.status, 'Pending') AS status
+            FROM candidates
+            LEFT JOIN recommendations USING (rec_id)`);
+
+        await run(`DELETE FROM recommendations`);
+        await run(`INSERT INTO recommendations (
+            rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level,
+            target_configuration, confidence, status
+        )
+        SELECT rec_id, resource_id, action, reason, estimated_monthly_saving, risk_level,
+            target_configuration, confidence, status
+        FROM generated_recommendations`);
+        await run(`DROP TABLE generated_recommendations`);
         const [resources, metricSummaries, existing] = await Promise.all([
             all(`SELECT * FROM inventory`),
             all(`SELECT
@@ -177,7 +329,9 @@ async function ensureGeneratedDataTables() {
         reason VARCHAR,
         estimated_monthly_saving DOUBLE,
         risk_level VARCHAR,
-        status VARCHAR,
+        target_configuration VARCHAR,
+        confidence DOUBLE,
+        status VARCHAR
         current_vcpu INT,
         current_ram_gb INT,
         target_vcpu INT,
@@ -191,6 +345,13 @@ async function ensureGeneratedDataTables() {
         sample_count INT,
         history_days DOUBLE
     )`);
+    const recommendationColumns = await all(`PRAGMA table_info('recommendations')`);
+    if (!recommendationColumns.some((column) => column.name === 'target_configuration')) {
+        await run(`ALTER TABLE recommendations ADD COLUMN target_configuration VARCHAR`);
+    }
+    if (!recommendationColumns.some((column) => column.name === 'confidence')) {
+        await run(`ALTER TABLE recommendations ADD COLUMN confidence DOUBLE`);
+    }
 
     const inventoryColumns = await all(`PRAGMA table_info('inventory')`);
     if (!inventoryColumns.some((column) => column.name === 'attached_to')) {
@@ -343,21 +504,19 @@ export async function initializeDatabase() {
         website VARCHAR NOT NULL,
         industry VARCHAR NOT NULL,
         contact_email VARCHAR NOT NULL,
-        address VARCHAR NOT NULL
+        address VARCHAR NOT NULL,
+        monthly_budget DOUBLE DEFAULT 1000000
     )`);
-
-    await run(`CREATE TABLE IF NOT EXISTS company_settings (
-        company_id VARCHAR PRIMARY KEY,
-        name VARCHAR NOT NULL,
-        website VARCHAR NOT NULL,
-        industry VARCHAR NOT NULL,
-        contact_email VARCHAR NOT NULL,
-        address VARCHAR NOT NULL
-    )`);
+    const companyColumns = await all(`PRAGMA table_info('company_settings')`);
+    if (!companyColumns.some((column) => column.name === 'monthly_budget')) {
+        await run(`ALTER TABLE company_settings ADD COLUMN monthly_budget DOUBLE DEFAULT 1000000`);
+    }
 
     const company = await all(`SELECT company_id FROM company_settings WHERE company_id = 'default'`);
     if (company.length === 0) {
-        await run(`INSERT INTO company_settings VALUES ('default', 'Your Company', '', '', '', '')`);
+        await run(`INSERT INTO company_settings (
+            company_id, name, website, industry, contact_email, address, monthly_budget
+        ) VALUES ('default', 'Your Company', '', '', '', '', 1000000)`);
     }
 
     await run(`UPDATE users SET is_admin = TRUE WHERE user_id = 'usr-3' AND email = 'admin@cloud.com' AND role = 'leadership'`);

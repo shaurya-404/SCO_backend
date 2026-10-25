@@ -140,7 +140,8 @@ def generate_vm_metrics(
         memory = rng.uniform(45, 67) + daily_wave * 8
         traffic, iops = rng.uniform(8, 24) + daily_wave * 16, rng.uniform(30, 85) + daily_wave * 45
 
-    if environment == "dev" and weekend:
+    off_hours = hour >= 20 or hour < 8
+    if environment in ("dev", "staging") and (weekend or off_hours):
         cpu, memory = rng.uniform(0.5, 3), rng.uniform(8, 18)
         traffic, iops = rng.uniform(0, 0.5), rng.uniform(0, 2)
 
@@ -241,6 +242,7 @@ def write_dataset(output_dir: Path, seed: int) -> tuple[int, int]:
         "patterns": [
             "Low steady utilization", "Bursty daily peaks", "Nightly batch workloads",
             "Higher steady production workloads", "Development VMs idle on weekends",
+            "Development and staging VMs idle from 8 PM to 8 AM and on weekends",
             "Orphaned volumes and public IPs have zero observed activity",
             "One four-sample production spike, flagged in metrics.csv",
         ],

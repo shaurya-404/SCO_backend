@@ -15,6 +15,7 @@ router.put("/company", authenticateToken, requireAdmin, controller.updateCompany
 // Core Resource & Analytics Routes (Protected)
 router.get("/inventory", authenticateToken, controller.getInventory)
 router.get("/inventory/stats", authenticateToken, controller.getInventoryStats)
+router.get("/metrics/fleet", authenticateToken, controller.getFleetMetrics)
 router.get("/resources/:id", authenticateToken, controller.getResourceById)
 router.get("/metrics/anomalies", authenticateToken, controller.getAnomalies)
 router.get("/metrics/fleet", authenticateToken, controller.getFleetUtilization)
