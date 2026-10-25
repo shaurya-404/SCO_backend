@@ -331,7 +331,7 @@ async function ensureGeneratedDataTables() {
         risk_level VARCHAR,
         target_configuration VARCHAR,
         confidence DOUBLE,
-        status VARCHAR
+        status VARCHAR,
         current_vcpu INT,
         current_ram_gb INT,
         target_vcpu INT,
@@ -366,7 +366,7 @@ async function ensureGeneratedDataTables() {
         await run(`ALTER TABLE metrics ADD COLUMN iops DOUBLE`);
     }
 
-    const recommendationColumns = await all(`PRAGMA table_info('recommendations')`);
+    //const recommendationColumns = await all(`PRAGMA table_info('recommendations')`);
     const recommendationMigrations = {
         current_vcpu: 'INT',
         current_ram_gb: 'INT',
